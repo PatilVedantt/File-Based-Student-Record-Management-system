@@ -1,6 +1,3 @@
-# File-Based-Student-Record-Management-system
-
-
 # File-Based Student Record Management System
 
 The **File-Based Student Record Management System** is a Python-based project developed to manage student information using file handling. It provides a simple and organized way to store, view, search, update, and delete student records.
