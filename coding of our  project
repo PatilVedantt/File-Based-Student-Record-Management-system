@@ -1,0 +1,342 @@
+import os
+import random
+import struct
+import sys
+import tempfile
+import unittest
+import zlib
+from dataclasses import dataclass
+from typing import Dict, List
+
+# ======================= MILESTONE 2: RECORD FORMAT =======================
+MAGIC = b"SRMS"
+VERSION = 1
+HEADER = struct.Struct("<4sIIII")            # 20 bytes
+RECORD = struct.Struct("<I48s32s16sHHfI")    # 112 bytes
+MAX_RECORDS = 1_000_000
+DEFAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "students.dat")
+
+assert HEADER.size == 20 and RECORD.size == 112
+
+
+class StorageError(Exception):
+    """Base class for all storage-layer problems."""
+
+
+class FormatError(StorageError):
+    """File is not a valid student database (bad magic, size, version...)."""
+
+
+class ChecksumError(StorageError):
+    """File content does not match its stored checksum (corruption)."""
+
+
+class DuplicateError(StorageError):
+    """A record with the same roll number already exists."""
+
+
+class ValidationError(ValueError):
+    """A field value is not acceptable."""
+
+
+@dataclass
+class Student:
+    roll_no: int
+    name: str
+    course: str
+    phone: str
+    age: int
+    year: int
+    marks: float = 0.0
+
+    def validate(self) -> None:
+        if not isinstance(self.roll_no, int) or not 1 <= self.roll_no <= 0xFFFFFFFF:
+            raise ValidationError("Roll number must be a whole number >= 1.")
+        for label, value, limit in (("Name", self.name, 47), ("Course", self.course, 31)):
+            if not value.strip():
+                raise ValidationError(f"{label} cannot be empty.")
+            if len(value.encode("utf-8")) > limit:
+                raise ValidationError(f"{label} is too long (max {limit} bytes).")
+        if not (self.phone.isdigit() and len(self.phone) == 10):
+            raise ValidationError("Phone must be exactly 10 digits.")
+        if not 5 <= self.age <= 100:
+            raise ValidationError("Age must be between 5 and 100.")
+        if not 1 <= self.year <= 6:
+            raise ValidationError("Year must be between 1 and 6.")
+        if not 0 <= self.marks <= 100:
+            raise ValidationError("Marks must be between 0 and 100.")
+
+    def pack(self) -> bytes:
+        return RECORD.pack(self.roll_no, self.name.strip().encode("utf-8"),
+                           self.course.strip().encode("utf-8"), self.phone.encode("ascii"),
+                           self.age, self.year, float(self.marks), 0)
+
+    @classmethod
+    def unpack(cls, fields: tuple) -> "Student":
+        roll, name, course, phone, age, year, marks, _reserved = fields
+        text = lambda b: b.rstrip(b"\x00").decode("utf-8")
+        return cls(roll, text(name), text(course), text(phone), age, year, round(marks, 2))
+
+
+# ======================= MILESTONE 4: STORAGE LAYER (file I/O) =======================
+class FileStorage:
+    """Reads/writes the whole database file. Knows nothing about menus or business rules."""
+
+    def __init__(self, path: str = DEFAULT_FILE):
+        self.path = path
+
+    def load(self) -> List[Student]:
+        """Load all records. A missing file means an empty database (first run)."""
+        if not os.path.exists(self.path):
+            return []
+        try:
+            with open(self.path, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            raise StorageError(f"Cannot read {self.path}: {exc}") from exc
+
+        if len(data) < HEADER.size:
+            raise FormatError("File is too small to be a student database.")
+        magic, version, count, rec_size, crc = HEADER.unpack_from(data)
+        if magic != MAGIC:
+            raise FormatError("Not a student database file (bad magic number).")
+        if version != VERSION:
+            raise FormatError(f"Unsupported file version {version} (expected {VERSION}).")
+        if rec_size != RECORD.size or count > MAX_RECORDS:
+            raise FormatError("Header contains impossible values.")
+        if len(data) != HEADER.size + count * rec_size:
+            raise FormatError("File is truncated or has extra bytes.")
+        payload = data[HEADER.size:]
+        if zlib.crc32(payload) & 0xFFFFFFFF != crc:
+            raise ChecksumError("Checksum mismatch - the file is corrupted.")
+        return [Student.unpack(f) for f in RECORD.iter_unpack(payload)]
+
+    def save(self, records: List[Student]) -> None:
+        """Atomic save: write a temp file, force it to disk, then replace the real file.
+        If the program crashes mid-write, the old file stays intact."""
+        payload = b"".join(r.pack() for r in records)
+        header = HEADER.pack(MAGIC, VERSION, len(records), RECORD.size,
+                             zlib.crc32(payload) & 0xFFFFFFFF)
+        folder = os.path.dirname(os.path.abspath(self.path))
+        fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(header)
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise StorageError(f"Cannot save {self.path}: {exc}") from exc
+
+    def info(self) -> dict:
+        """Header details + file size (used by the demo's 'file info' option)."""
+        if not os.path.exists(self.path):
+            raise StorageError("Database file does not exist yet.")
+        with open(self.path, "rb") as fh:
+            raw = fh.read(HEADER.size)
+        if len(raw) < HEADER.size:
+            raise FormatError("File is too small to be a student database.")
+        magic, version, count, rec_size, crc = HEADER.unpack(raw)
+        return {"path": self.path, "size_bytes": os.path.getsize(self.path), "magic": magic.decode("ascii", "replace"),
+                "version": version, "records": count, "record_size": rec_size, "crc32": f"{crc:08X}"}
+
+
+class StudentDB:
+    """In-memory structure: a list (keeps order) + a dict index by roll number (O(1) lookup).
+    Loads on start, saves after every change, so data survives a restart."""
+
+    def __init__(self, path: str = DEFAULT_FILE):
+        self.storage = FileStorage(path)
+        self._records: List[Student] = self.storage.load()
+        self._index: Dict[int, Student] = {s.roll_no: s for s in self._records}
+
+    def insert(self, student: Student) -> None:
+        student.validate()
+        if student.roll_no in self._index:
+            raise DuplicateError(f"Roll number {student.roll_no} already exists.")
+        self._records.append(student)
+        self._index[student.roll_no] = student
+        try:
+            self.storage.save(self._records)
+        except StorageError:                      # keep memory and file consistent
+            self._records.pop()
+            del self._index[student.roll_no]
+            raise
+
+    def get(self, roll_no: int) -> Student:
+        if roll_no not in self._index:
+            raise KeyError(f"No student with roll number {roll_no}.")
+        return self._index[roll_no]
+
+    def all(self) -> List[Student]:
+        return list(self._records)
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+
+# ======================= LIVE DEMO (Milestone 4 evidence) =======================
+FIRST = ["Aarav", "Diya", "Rohan", "Isha", "Kabir", "Meera", "Vivaan", "Anaya", "Arjun", "Sara"]
+LAST = ["Sharma", "Patel", "Mehta", "Iyer", "Khan", "Singh", "Joshi", "Nair", "Das", "Gupta"]
+COURSES = ["B.Voc BDCC", "B.Sc IT", "BCA", "B.Com"]
+
+
+def seed(db: StudentDB, n: int) -> int:
+    rng = random.Random(42)
+    start = max((s.roll_no for s in db.all()), default=1000) + 1
+    for i in range(n):
+        db.insert(Student(start + i, f"{rng.choice(FIRST)} {rng.choice(LAST)}", rng.choice(COURSES),
+                          str(rng.randint(6000000000, 9999999999)), rng.randint(17, 24),
+                          rng.randint(1, 3), round(rng.uniform(30, 99), 1)))
+    return n
+
+
+def print_table(students: List[Student]) -> None:
+    if not students:
+        print("  (no records)")
+        return
+    print(f"  {'Roll':<7}{'Name':<22}{'Course':<14}{'Phone':<12}{'Age':<5}{'Yr':<4}{'Marks':>6}")
+    print("  " + "-" * 70)
+    for s in students:
+        print(f"  {s.roll_no:<7}{s.name[:20]:<22}{s.course[:12]:<14}{s.phone:<12}{s.age:<5}{s.year:<4}{s.marks:>6.1f}")
+    print(f"\n  Total: {len(students)} record(s)")
+
+
+def ask_int(prompt: str) -> int:
+    try:
+        return int(input(f"  {prompt}: ").strip())
+    except ValueError:
+        raise ValidationError("Please enter a whole number.")
+
+
+def demo(path: str = DEFAULT_FILE) -> None:
+    try:
+        db = StudentDB(path)
+    except StorageError as exc:
+        print(f"Fatal: {exc}")
+        return
+    print("\n" + "=" * 72 + "\n  STUDENT RECORD SYSTEM - MILESTONE 4: STORAGE LAYER DEMO\n" + "=" * 72)
+    print(f"  Loaded {len(db)} record(s) from {os.path.basename(path)}")
+    while True:
+        print("\n  1. Add a student\n  2. List all students\n  3. Add N sample students"
+              "\n  4. Show file info (header + checksum)\n  5. Find by roll number\n  0. Exit")
+        try:
+            choice = input("\n  Enter choice: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Goodbye!")
+            return
+        try:
+            if choice == "0":
+                print("  Data is already saved. Goodbye!")
+                return
+            elif choice == "1":
+                db.insert(Student(ask_int("Roll number"), input("  Name: "), input("  Course: "),
+                                  input("  Phone (10 digits): ").strip(), ask_int("Age"),
+                                  ask_int("Year (1-6)"), float(input("  Marks (0-100): ") or 0)))
+                print("  Saved to file.")
+            elif choice == "2":
+                print_table(db.all())
+            elif choice == "3":
+                print(f"  Added {seed(db, ask_int('How many'))} sample students and saved.")
+            elif choice == "4":
+                for k, v in db.storage.info().items():
+                    print(f"  {k:<12}: {v}")
+            elif choice == "5":
+                print_table([db.get(ask_int("Roll number"))])
+            else:
+                print("  ! Invalid choice.")
+        except (ValidationError, StorageError, KeyError, ValueError) as exc:
+            print(f"  ! {exc.args[0] if exc.args else exc}")
+
+
+# ======================= SELF-TEST (Milestone 4 test evidence) =======================
+class StorageTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "t.dat")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def sample(self, roll=1):
+        return Student(roll, "Test Student", "BCA", "9876543210", 20, 1, 75.5)
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(len(StudentDB(self.path)), 0)
+
+    def test_survives_restart(self):
+        db = StudentDB(self.path)
+        db.insert(self.sample(1))
+        db.insert(self.sample(2))
+        again = StudentDB(self.path)                      # simulates closing and reopening
+        self.assertEqual(len(again), 2)
+        self.assertEqual(again.get(2), self.sample(2))
+
+    def test_duplicate_id_rejected(self):
+        db = StudentDB(self.path)
+        db.insert(self.sample(7))
+        with self.assertRaises(DuplicateError):
+            db.insert(self.sample(7))
+        self.assertEqual(len(StudentDB(self.path)), 1)
+
+    def test_validation(self):
+        db = StudentDB(self.path)
+        for bad in (Student(0, "A", "B", "9876543210", 20, 1), Student(1, "", "B", "9876543210", 20, 1),
+                    Student(1, "A", "B", "123", 20, 1), Student(1, "A", "B", "9876543210", 2, 1),
+                    Student(1, "A", "B", "9876543210", 20, 9), Student(1, "A", "B", "9876543210", 20, 1, 120)):
+            with self.assertRaises(ValidationError):
+                db.insert(bad)
+
+    def test_many_records_roundtrip(self):
+        db = StudentDB(self.path)
+        seed(db, 500)
+        again = StudentDB(self.path)
+        self.assertEqual(len(again), 500)
+        self.assertEqual(again.all(), db.all())
+
+    def test_unicode_name(self):
+        db = StudentDB(self.path)
+        db.insert(Student(5, "Ananya Iyer", "B.Voc", "9876543210", 19, 1, 80))
+        self.assertEqual(StudentDB(self.path).get(5).name, "Ananya Iyer")
+
+    def test_corruption_detected(self):
+        db = StudentDB(self.path)
+        seed(db, 10)
+        with open(self.path, "r+b") as fh:
+            fh.seek(HEADER.size + 10)
+            fh.write(b"\xFF")
+        with self.assertRaises(ChecksumError):
+            StudentDB(self.path)
+
+    def test_bad_magic_and_truncation(self):
+        db = StudentDB(self.path)
+        seed(db, 5)
+        with open(self.path, "rb") as fh:
+            good = fh.read()
+        with open(self.path, "wb") as fh:
+            fh.write(b"XXXX" + good[4:])
+        with self.assertRaises(FormatError):
+            StudentDB(self.path)
+        with open(self.path, "wb") as fh:
+            fh.write(good[:-50])
+        with self.assertRaises(FormatError):
+            StudentDB(self.path)
+        with open(self.path, "wb") as fh:
+            fh.write(b"abc")
+        with self.assertRaises(FormatError):
+            StudentDB(self.path)
+
+    def test_no_temp_files_left(self):
+        db = StudentDB(self.path)
+        seed(db, 3)
+        self.assertEqual([f for f in os.listdir(self.dir.name) if f.endswith(".tmp")], [])
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        unittest.main(argv=[sys.argv[0], "-v"])
+    else:
+        demo()
